@@ -45,7 +45,7 @@ static std::wstring GetLogFilePath() {
         return L"activity_log.csv"; 
     }
     std::wstring dir = std::wstring(appData) + L"\\WindowTimeTracker";
-    CreateDirectoryW(dir.c_str(), nullptr); 
+    CreateDirectoryW(dir.c_str(), nullptr);
     return dir + L"\\activity_log.csv";
 }
 
@@ -84,9 +84,48 @@ static bool GetActiveWindowInfo(std::wstring& processName, std::wstring& windowT
     return true;
 }
 
-// ---------- CSV ----------
+static std::string WideToUtf8(const std::wstring& w)
+{
+    if (w.empty()) return {};
+
+    int size = WideCharToMultiByte(
+        CP_UTF8, 0,
+        w.c_str(), (int)w.size(),
+        nullptr, 0,
+        nullptr, nullptr);
+
+    std::string out(size, '\0');
+
+    WideCharToMultiByte(
+        CP_UTF8, 0,
+        w.c_str(), (int)w.size(),
+        &out[0], size,
+        nullptr, nullptr);
+
+    return out;
+}
+
+static std::wstring Utf8ToWide(const std::string& s)
+{
+    if (s.empty()) return {};
+
+    int size = MultiByteToWideChar(
+        CP_UTF8, 0,
+        s.c_str(), (int)s.size(),
+        nullptr, 0);
+
+    std::wstring out(size, L'\0');
+
+    MultiByteToWideChar(
+        CP_UTF8, 0,
+        s.c_str(), (int)s.size(),
+        &out[0], size);
+
+    return out;
+}
+
 static std::wstring CsvEscape(const std::wstring& field) {
-    bool needsQuotes = field.find_first_of(L",\"\n") != std::wstring::npos;
+    bool needsQuotes = field.find_first_of(L";\"\n") != std::wstring::npos;
     if (!needsQuotes) return field;
     std::wstring out = L"\"";
     for (wchar_t c : field) {
@@ -98,12 +137,16 @@ static std::wstring CsvEscape(const std::wstring& field) {
 }
 
 static void EnsureCsvHeader() {
-    std::wifstream test(g_logPath);
-    bool exists = test.good();
+    std::ifstream test(g_logPath, std::ios::binary);
+    bool exists = test.good() && test.peek() != std::ifstream::traits_type::eof();
     test.close();
     if (!exists) {
-        std::wofstream out(g_logPath, std::ios::app);
-        out << L"Date,StartTime,EndTime,DurationSeconds,Process,WindowTitle\n";
+        std::ofstream out(g_logPath, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) return;
+        const unsigned char bom[] = { 0xEF, 0xBB, 0xBF };
+        out.write(reinterpret_cast<const char*>(bom), sizeof(bom));
+        out << "sep=;\r\n";
+        out << "Date;StartTime;EndTime;DurationSeconds;Process;WindowTitle\r\n";
     }
 }
 
@@ -120,12 +163,16 @@ static void WriteSession(const Session& s, time_t endTime) {
     wcsftime(startBuf, 16, L"%H:%M:%S", &startTm);
     wcsftime(endBuf, 16, L"%H:%M:%S", &endTm);
 
-    std::wofstream out(g_logPath, std::ios::app);
+    std::wstringstream lineW;
+    lineW << dateBuf << L";" << startBuf << L";" << endBuf << L";"
+        << (long)duration << L";"
+        << CsvEscape(s.processName) << L";"
+        << CsvEscape(s.windowTitle) << L"\r\n";
+
+    std::ofstream out(g_logPath, std::ios::binary | std::ios::app);
     if (!out.is_open()) return;
-    out << dateBuf << L"," << startBuf << L"," << endBuf << L","
-        << (long)duration << L","
-        << CsvEscape(s.processName) << L","
-        << CsvEscape(s.windowTitle) << L"\n";
+    std::string lineUtf8 = WideToUtf8(lineW.str());
+    out.write(lineUtf8.data(), (std::streamsize)lineUtf8.size());
 }
 
 static std::vector<std::wstring> ParseCsvLine(const std::wstring& line) {
@@ -143,7 +190,7 @@ static std::vector<std::wstring> ParseCsvLine(const std::wstring& line) {
         }
         else {
             if (c == L'"') inQuotes = true;
-            else if (c == L',') { fields.push_back(cur); cur.clear(); }
+            else if (c == L';') { fields.push_back(cur); cur.clear(); }
             else cur += c;
         }
     }
@@ -159,16 +206,23 @@ static void ShowTodaySummary() {
     wcsftime(todayBuf, 16, L"%Y-%m-%d", &nowTm);
     std::wstring today(todayBuf);
 
-    std::wifstream in(g_logPath);
+    std::ifstream in(g_logPath, std::ios::binary);
     if (!in.is_open()) {
-        MessageBoxW(nullptr, L"No data registered yet.", L"Summary of Today", MB_OK | MB_ICONINFORMATION);
+        MessageBoxW(nullptr, L"No data registered yet.", L"Today's Summary", MB_OK | MB_ICONINFORMATION);
         return;
     }
 
     std::map<std::wstring, long> totals;
-    std::wstring line;
+    std::string lineUtf8;
     bool first = true;
-    while (std::getline(in, line)) {
+    while (std::getline(in, lineUtf8)) {
+        if (!lineUtf8.empty() && lineUtf8.back() == '\r') lineUtf8.pop_back();
+        if (!lineUtf8.empty() && (unsigned char)lineUtf8[0] == 0xEF &&
+            lineUtf8.size() >= 3 && (unsigned char)lineUtf8[1] == 0xBB && (unsigned char)lineUtf8[2] == 0xBF) {
+            lineUtf8 = lineUtf8.substr(3);
+        }
+        if (lineUtf8.rfind("sep=", 0) == 0) continue; 
+        std::wstring line = Utf8ToWide(lineUtf8);
         if (first) { first = false; continue; }
         if (line.empty()) continue;
         auto f = ParseCsvLine(line);
@@ -179,7 +233,7 @@ static void ShowTodaySummary() {
     }
 
     if (totals.empty()) {
-        MessageBoxW(nullptr, L"No activities registered today.", L"Summary of Today", MB_OK | MB_ICONINFORMATION);
+        MessageBoxW(nullptr, L"No activities registered today.", L"Today's Summary", MB_OK | MB_ICONINFORMATION);
         return;
     }
 
@@ -187,7 +241,7 @@ static void ShowTodaySummary() {
     std::sort(sorted.begin(), sorted.end(), [](auto& a, auto& b) { return a.second > b.second; });
 
     std::wstringstream msg;
-    msg << L"Summary of Today (" << today << L"):\n\n";
+    msg << L"Today's Summary (" << today << L"):\n\n";
     for (auto& p : sorted) {
         long secs = p.second;
         int h = (int)(secs / 3600);
@@ -198,7 +252,7 @@ static void ShowTodaySummary() {
         msg << p.first << L" — " << buf << L"\n";
     }
 
-    MessageBoxW(nullptr, msg.str().c_str(), L"Summary of Today", MB_OK | MB_ICONINFORMATION);
+    MessageBoxW(nullptr, msg.str().c_str(), L"Today's Summary", MB_OK | MB_ICONINFORMATION);
 }
 
 static void AddTrayIcon(HWND hwnd) {
@@ -215,7 +269,7 @@ static void AddTrayIcon(HWND hwnd) {
 
 static void ShowTrayMenu(HWND hwnd) {
     HMENU menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, ID_TRAY_SUMMARY, L"Summary of Today");
+    AppendMenuW(menu, MF_STRING, ID_TRAY_SUMMARY, L"Today's Summary");
     AppendMenuW(menu, MF_STRING, ID_TRAY_OPENFOLDER, L"Open Log Folder");
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, ID_TRAY_EXIT, L"Exit");
@@ -233,7 +287,7 @@ static void PollActiveWindow() {
     if (!GetActiveWindowInfo(proc, title)) return;
 
     if (g_current.active && g_current.processName == proc && g_current.windowTitle == title) {
-        return; 
+        return;
     }
 
     time_t now = time(nullptr);
@@ -294,12 +348,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-// ---------- Entry point ----------
 int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int) {
     HANDLE mutex = CreateMutexW(nullptr, TRUE, L"WindowTimeTracker_SingleInstanceMutex");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         MessageBoxW(nullptr, L"Window Time Tracker is already running (see the system tray).",
-            L"Already Running", MB_OK | MB_ICONINFORMATION);
+            L"Already running", MB_OK | MB_ICONINFORMATION);
         return 0;
     }
 
